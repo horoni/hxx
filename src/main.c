@@ -94,6 +94,7 @@ int main(int argc, char *argv[])
 {
   struct editor_ctx ctx;
   struct editor_view view;
+  int c;
 
   if (argc < 2)
     return 1;
@@ -118,13 +119,19 @@ int main(int argc, char *argv[])
   }
 
   for(;!view.want_quit;) {
-    erase();
     draw_editor(&ctx, &view);
     refresh();
 
     view.c = getch();
     getmaxyx(stdscr, view.max_y, view.max_x);
     handle_input(&ctx, &view);
+
+    nodelay(stdscr, true);
+    while ((c = getch()) != ERR) {
+      view.c = c;
+      handle_input(&ctx, &view);
+    }
+    nodelay(stdscr, false);
   }
 
   endwin();
@@ -136,6 +143,7 @@ int main(int argc, char *argv[])
 
 void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
 {
+  static const char HEX[] = "0123456789abcdef";
   int max_y, max_x;
 
   getmaxyx(stdscr, max_y, max_x);
@@ -162,7 +170,9 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
       int x_pos = 10 + (i * 2) + i;
 
       char hex_num[3];
-      snprintf(hex_num, sizeof(hex_num), "%02x", b);
+      hex_num[0] = HEX[(b >> 4) & 0x0F];
+      hex_num[1] = HEX[b & 0x0F];
+      hex_num[2] = '\0';
 
       int attr_base = COLOR_PAIR(CP_HEX);
       if (b == 0x00)
