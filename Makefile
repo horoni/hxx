@@ -1,5 +1,6 @@
 PHONY   := all run clean valgrind
 PROJECT := hxx
+PREFIX  ?= /usr/local
 
 SRC_DIR   := src
 OBJ_DIR   := obj
@@ -54,4 +55,5 @@ clean:
 valgrind: $(PROJECT)
 	@valgrind ./$(PROJECT) $(UARG)
 
-
+install: $(PROJECT)
+	cp $(PROJECT) $(PREFIX)/bin/
