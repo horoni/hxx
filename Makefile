@@ -27,7 +27,7 @@ RM    := rm -f
 RMF   := rm -rf
 RMDIR := rmdir
 
-all: run
+all: $(PROJECT)
 
 run: $(PROJECT)
 	@./$(PROJECT) $(UARG)
@@ -52,6 +52,6 @@ clean:
 	@$(RMF) $(OBJ_DIR) $(PROJECT)
 
 valgrind: $(PROJECT)
-	@valgrind ./$(PROJECT)
+	@valgrind ./$(PROJECT) $(UARG)
 
 
