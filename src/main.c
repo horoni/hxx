@@ -449,7 +449,7 @@ void open_editor(struct editor_ctx *ctx, const char *filename)
     exit(1);
   }
 
-  if (madvise(ctx->data, ctx->size, MADV_RANDOM) < 0) {
+  if (madvise(ctx->data, ctx->size, MADV_SEQUENTIAL) < 0) {
     perror("madvise failed");
   }
 }
