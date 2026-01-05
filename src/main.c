@@ -46,7 +46,7 @@ typedef struct action {
   uint8_t new_val;
   struct action *prev;
   struct action *next;
-} action_t;
+} __attribute__((packed)) action_t;
 
 struct editor_ctx {
   int fd;
