@@ -150,29 +150,31 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
 
   for (int row = 0; row < max_y - 2; row++) {
     size_t lineoff = v->page + (row * 16);
+
+    move(row, 0);
+
     if (lineoff >= ctx->size) {
-      mvprintw(row, 0, "~~");
+      addstr("~~");
       break;
     }
 
-    mvprintw(row, 0, "%08zx: ", lineoff);
+    printw("%08zx: ", lineoff);
 
+    size_t bytes = 16;
+    if (lineoff + 16 > ctx->size)
+      bytes = ctx->size - lineoff;
+
+    /* hex part */
     for (size_t i = 0; i < 16; i++) {
+      if (i >= bytes) {
+        addstr("   ");
+        continue;
+      }
+
       size_t idx = lineoff + i;
-
-      if (idx >= ctx->size)
-        break;
-
       unsigned char b = ctx->data[idx];
       int is_cursor = (idx == v->cur);
       int is_print = isprint(b);
-
-      int x_pos = 10 + (i * 2) + i;
-
-      char hex_num[3];
-      hex_num[0] = HEX[(b >> 4) & 0x0F];
-      hex_num[1] = HEX[b & 0x0F];
-      hex_num[2] = '\0';
 
       int attr_base = COLOR_PAIR(CP_HEX);
       if (b == 0x00)
@@ -181,63 +183,68 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
         attr_base = COLOR_PAIR(CP_ASCII);
 
       int attr_high = attr_base;
-      if (is_cursor) {
-        if (v->mode == NORMAL || (v->mode == INSERT && v->nibble == 0)) {
+      if (is_cursor && (v->mode == NORMAL || (v->mode == INSERT && v->nibble == 0)))
           attr_high |= A_REVERSE;
-        }
-      }
 
       attron(attr_high);
-      mvaddch(row, x_pos, hex_num[0]);
+      addch(HEX[(b >> 4) & 0x0F]);
       attroff(attr_high);
 
       int attr_low = attr_base;
-      if (is_cursor) {
-        if (v->mode == NORMAL || (v->mode == INSERT && v->nibble == 1)) {
+      if (is_cursor && (v->mode == NORMAL || (v->mode == INSERT && v->nibble == 1)))
           attr_low |= A_REVERSE;
-        }
-      }
 
       attron(attr_low);
-      mvaddch(row, x_pos + 1, hex_num[1]);
+      addch(HEX[b & 0x0F]);
       attroff(attr_low);
 
-      int ascii_x = 62 + i;
-      int ascii_attr = COLOR_PAIR(CP_ASCII);
+      addch(' ');
+    }
 
+    addstr("| ");
+
+    for (size_t i = 0; i < bytes; i++) {
+      size_t idx = lineoff + i;
+      unsigned char b = ctx->data[idx];
+      int is_cursor = (idx == v->cur);
+
+      int attr = COLOR_PAIR(CP_ASCII);
       if (is_cursor)
-        ascii_attr |= A_REVERSE;
+        attr |= A_REVERSE;
       
-      attron(ascii_attr);
-      if (is_print) {
-        mvaddch(row, ascii_x, b);
+      attron(attr);
+      if (isprint(b)) {
+        addch(b);
       } else {
         if (!is_cursor)
           attroff(COLOR_PAIR(CP_ASCII));
-        mvaddch(row, ascii_x, '.');
+        addch('.');
         if (!is_cursor)
           attron(COLOR_PAIR(CP_ASCII));
       }
-      attroff(ascii_attr);
+      attroff(attr);
     }
-    mvprintw(row, 62 - 2, "|");
   }
 
+  move(max_y - 2, 0);
   attron(A_REVERSE);
   for (int i = 0; i < max_x; i++)
-    mvaddch(max_y - 2, i, ' ');
+    addch(' ');
   attroff(A_REVERSE);
 
-  mvprintw(max_y - 1, 0, "POS: %08zx | VAL: %02x | DEC: %3d ", v->cur, ctx->data[v->cur], ctx->data[v->cur]);
-
-  if (ctx->changed) {
-    attron(COLOR_PAIR(CP_ASCII) | A_BOLD);
-    mvprintw(max_y - 1, max_x - 10, "[+]");
-    attroff(COLOR_PAIR(CP_ASCII) | A_BOLD);
-  }
+  move(max_y - 1, 0);
+  clrtoeol();
+  printw("POS: %08zx | VAL: %02x | DEC: %3d ", v->cur, ctx->data[v->cur], ctx->data[v->cur]);
 
   if (v->mode == INSERT)
-    mvprintw(max_y - 1, 35, "| --INSERT--");
+    addstr("| --INSERT-- ");
+
+  if (ctx->changed) {
+    addch('|');
+    attron(COLOR_PAIR(CP_ASCII) | A_BOLD);
+    addstr(" [+]");
+    attroff(COLOR_PAIR(CP_ASCII) | A_BOLD);
+  }
 }
 
 void handle_input(struct editor_ctx *ctx, struct editor_view *v)
@@ -381,6 +388,9 @@ void handle_jump(struct editor_ctx *ctx, struct editor_view *v)
 
   v->cur = off;
   v->page = (v->cur / 16) * 16;
+
+  /* if cursor move to EOF we need to clear garbage on the screen */
+  erase();
 }
 
 void open_editor(struct editor_ctx *ctx, const char *filename)
