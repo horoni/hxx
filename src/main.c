@@ -63,6 +63,7 @@ struct editor_view {
   size_t page;
   int mode;
   int nibble;
+  uint8_t snap;
   char c; /* pressed char */
 };
 
@@ -84,6 +85,7 @@ void write_byte(struct editor_ctx *ctx, size_t off, uint8_t new);
 
 void hist_init(struct editor_ctx *ctx);
 void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new);
+void hist_add_smart(struct editor_ctx *ctx, size_t off, uint8_t old);
 void hist_undo(struct editor_ctx *ctx, struct editor_view *v);
 void hist_redo(struct editor_ctx *ctx, struct editor_view *v);
 
@@ -230,8 +232,11 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
 {
   if (v->mode == INSERT) {
     if (v->c == 27) {
+      if (v->nibble == 1) {
+        hist_add_smart(ctx, v->cur, v->snap);
+        v->nibble = 0;
+      }
       v->mode = NORMAL;
-      v->nibble = 0;
       return;
     }
 
@@ -242,16 +247,17 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
       uint8_t new_byte;
 
       if (v->nibble == 0) {
+        v->snap = cur_byte;
         new_byte = (nib << 4) | (cur_byte & 0x0F);
         write_byte(ctx, v->cur, new_byte);
         v->nibble = 1;
       } else {
         new_byte = nib | (cur_byte & 0xF0);
         write_byte(ctx, v->cur, new_byte);
+        hist_add_smart(ctx, v->cur, v->snap);
         v->nibble = 0;
-        if (v->cur + 1 < ctx->size) {
+        if (v->cur + 1 < ctx->size)
           v->cur++;
-        }
       }
     }
   } else {
@@ -477,13 +483,6 @@ void write_byte(struct editor_ctx *ctx, size_t off, uint8_t new)
   if (off >= ctx->size)
     return;
 
-  uint8_t old = ctx->data[off];
-
-  if (old == new)
-    return;
-
-  hist_add(ctx, off, old, new);
-
   ctx->data[off] = new;
   ctx->changed = 1;
 }
@@ -514,6 +513,13 @@ void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new)
 
   ctx->hist->next = act;
   ctx->hist = act;
+}
+
+void hist_add_smart(struct editor_ctx *ctx, size_t off, uint8_t old)
+{
+  uint8_t new = ctx->data[off];
+  if (new != old)
+    hist_add(ctx, off, old, new);
 }
 
 void hist_undo(struct editor_ctx *ctx, struct editor_view *v)
