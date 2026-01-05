@@ -63,8 +63,8 @@ struct editor_view {
   size_t page;
   int mode;
   int nibble;
+  int c; /* pressed char */
   uint8_t snap;
-  char c; /* pressed char */
 };
 
 enum {
