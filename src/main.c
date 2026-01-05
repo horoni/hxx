@@ -23,6 +23,7 @@
 */
 
 #define _GNU_SOURCE
+#include <assert.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <ncurses.h>
@@ -39,11 +40,20 @@
 #define CP_ASCII  3
 #define CP_NULL   4
 
+typedef struct action {
+  size_t off;
+  uint8_t old_val;
+  uint8_t new_val;
+  struct action *prev;
+  struct action *next;
+} action_t;
+
 struct editor_ctx {
   int fd;
   size_t size;
   unsigned char *data;
   int changed;
+  action_t *hist; /* head */
 };
 
 struct editor_view {
@@ -72,6 +82,11 @@ void extend_file(struct editor_ctx *ctx, size_t siz);
 
 void write_byte(struct editor_ctx *ctx, size_t off, uint8_t new);
 
+void hist_init(struct editor_ctx *ctx);
+void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new);
+void hist_undo(struct editor_ctx *ctx, struct editor_view *v);
+void hist_redo(struct editor_ctx *ctx, struct editor_view *v);
+
 int main(int argc, char *argv[])
 {
   struct editor_ctx ctx;
@@ -82,6 +97,8 @@ int main(int argc, char *argv[])
 
   memset(&ctx, 0, sizeof(ctx));
   memset(&view, 0, sizeof(view));
+
+  hist_init(&ctx);
   open_editor(&ctx, argv[1]);
 
   initscr();
@@ -268,6 +285,12 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
       case 'w':
         flush_data(ctx);
         break;
+      case 'u': /* undo */
+        hist_undo(ctx, v);
+        break;
+      case 18: /* CTRL+R : redo */
+        hist_redo(ctx, v);
+        break;
       case 'q': /* quit */
         /* print message to user "no write since last change" */
         if (!ctx->changed)
@@ -290,10 +313,10 @@ void handle_jump(struct editor_ctx *ctx, struct editor_view *v)
 {
   char buf[64] = {0};
   int pos = 0;
-  int max_y, max_x;
+  int max_y;
   int c;
 
-  getmaxyx(stdscr, max_y, max_x);
+  max_y = getmaxy(stdscr);
 
   attron(A_BOLD);
   mvprintw(max_y - 1, 0, ":");
@@ -381,6 +404,16 @@ void close_editor(struct editor_ctx *ctx)
   if (!ctx)
     return;
 
+  action_t *cur = ctx->hist;
+  while (cur->prev) {
+    cur = cur->prev;
+  }
+  while (cur) {
+    action_t *next = cur->next;
+    free(cur);
+    cur = next;
+  }
+
   if (ctx->data != NULL && ctx->data != MAP_FAILED) {
     if (msync(ctx->data, ctx->size, MS_SYNC) < 0) {
       perror("msync() failed (data lost?)");
@@ -444,7 +477,68 @@ void write_byte(struct editor_ctx *ctx, size_t off, uint8_t new)
   if (off >= ctx->size)
     return;
 
+  uint8_t old = ctx->data[off];
+
+  if (old == new)
+    return;
+
+  hist_add(ctx, off, old, new);
+
   ctx->data[off] = new;
   ctx->changed = 1;
 }
 
+void hist_init(struct editor_ctx *ctx)
+{
+  ctx->hist = malloc(sizeof(action_t));
+  bzero(ctx->hist, sizeof(action_t));
+  assert(ctx->hist->next == NULL);
+  assert(ctx->hist->prev == NULL);
+}
+
+void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new)
+{
+  action_t *cur = ctx->hist->next;
+  while (cur) {
+    action_t *next = cur->next;
+    free(cur);
+    cur = next;
+  }
+
+  action_t *act = malloc(sizeof(action_t));
+  act->off = off;
+  act->old_val = old;
+  act->new_val = new;
+  act->next = NULL;
+  act->prev = ctx->hist;
+
+  ctx->hist->next = act;
+  ctx->hist = act;
+}
+
+void hist_undo(struct editor_ctx *ctx, struct editor_view *v)
+{
+  if (!ctx->hist->prev)
+    return;
+
+  action_t *act = ctx->hist;
+
+  ctx->data[act->off] = act->old_val;
+  ctx->hist = act->prev;
+  ctx->changed = 1;
+
+  v->cur = act->off;
+}
+
+void hist_redo(struct editor_ctx *ctx, struct editor_view *v)
+{
+  if (!ctx->hist->next)
+    return;
+
+  action_t *act = ctx->hist->next;
+  ctx->data[act->off] = act->new_val;
+  ctx->hist = act;
+  ctx->changed = 1;
+
+  v->cur = act->off;
+}
