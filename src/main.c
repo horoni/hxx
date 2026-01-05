@@ -84,6 +84,7 @@ void extend_file(struct editor_ctx *ctx, size_t siz);
 void write_byte(struct editor_ctx *ctx, size_t off, uint8_t new);
 
 void hist_init(struct editor_ctx *ctx);
+void hist_free(struct editor_ctx *ctx);
 void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new);
 void hist_add_smart(struct editor_ctx *ctx, size_t off, uint8_t old);
 void hist_undo(struct editor_ctx *ctx, struct editor_view *v);
@@ -127,6 +128,7 @@ int main(int argc, char *argv[])
   }
 
   endwin();
+  hist_free(&ctx);
   close_editor(&ctx);
 
   return 0;
@@ -410,16 +412,6 @@ void close_editor(struct editor_ctx *ctx)
   if (!ctx)
     return;
 
-  action_t *cur = ctx->hist;
-  while (cur->prev) {
-    cur = cur->prev;
-  }
-  while (cur) {
-    action_t *next = cur->next;
-    free(cur);
-    cur = next;
-  }
-
   if (ctx->data != NULL && ctx->data != MAP_FAILED) {
     if (msync(ctx->data, ctx->size, MS_SYNC) < 0) {
       perror("msync() failed (data lost?)");
@@ -493,6 +485,19 @@ void hist_init(struct editor_ctx *ctx)
   bzero(ctx->hist, sizeof(action_t));
   assert(ctx->hist->next == NULL);
   assert(ctx->hist->prev == NULL);
+}
+
+void hist_free(struct editor_ctx *ctx)
+{
+  action_t *cur = ctx->hist;
+  while (cur->prev) {
+    cur = cur->prev;
+  }
+  while (cur) {
+    action_t *next = cur->next;
+    free(cur);
+    cur = next;
+  }
 }
 
 void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new)
