@@ -349,11 +349,6 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
   if (v->cur >= v->page + ((v->max_y - 2) * 16)) {
     size_t cur_row_start = (v->cur / 16) * 16;
     v->page = cur_row_start - ((v->max_y - 3) * 16);
-
-    size_t window_size = (v->max_y - 2) * 16;
-    if (v->page + window_size < ctx->size) {
-      madvise(ctx->data + v->page, window_size, MADV_WILLNEED);
-    }
   }
 
   if (v->cur < v->page) {
