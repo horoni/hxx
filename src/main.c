@@ -126,12 +126,12 @@ int main(int argc, char *argv[])
     getmaxyx(stdscr, view.max_y, view.max_x);
     handle_input(&ctx, &view);
 
-    nodelay(stdscr, true);
+    nodelay(stdscr, TRUE);
     while ((c = getch()) != ERR) {
       view.c = c;
       handle_input(&ctx, &view);
     }
-    nodelay(stdscr, false);
+    nodelay(stdscr, FALSE);
   }
 
   endwin();
@@ -148,62 +148,93 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
 
   getmaxyx(stdscr, max_y, max_x);
 
+  chtype line_buf[max_x + 1];
+
   for (int row = 0; row < max_y - 2; row++) {
     size_t lineoff = v->page + (row * 16);
+    int pos = 0;
 
-    move(row, 0);
+    for(int i = 0; i < max_x; i++)
+      line_buf[i] = ' ';
+    line_buf[max_x] = '\0';
 
     if (lineoff >= ctx->size) {
-      addstr("~~");
+      mvaddstr(row, 0, "~~");
       break;
     }
 
-    printw("%08zx: ", lineoff);
+    /* -- offset -- */
+    char addr_str[16];
+    snprintf(addr_str, 16, "%08zx:", lineoff);
+    for (int i = 0; i < 9; i++)
+      if (pos < max_x)
+        line_buf[pos++] = addr_str[i];
+
+    if (pos < max_x)
+      line_buf[pos++] = ' ';
 
     size_t bytes = 16;
     if (lineoff + 16 > ctx->size)
       bytes = ctx->size - lineoff;
 
-    /* hex part */
+    int hex_start = pos;
+
+    /* --- HEX --- */
     for (size_t i = 0; i < 16; i++) {
-      if (i >= bytes) {
-        addstr("   ");
-        continue;
-      }
+      if (i >= bytes)
+        break;
 
       size_t idx = lineoff + i;
       unsigned char b = ctx->data[idx];
+
       int is_cursor = (idx == v->cur);
       int is_print = isprint(b);
 
-      int attr_base = COLOR_PAIR(CP_HEX);
+      /* -- base attr -- */
+      int attr = COLOR_PAIR(CP_HEX);
       if (b == 0x00)
-        attr_base = COLOR_PAIR(CP_NULL) | A_DIM;
+        attr = COLOR_PAIR(CP_NULL) | A_DIM;
       if (is_print)
-        attr_base = COLOR_PAIR(CP_ASCII);
+        attr = COLOR_PAIR(CP_ASCII);
 
-      int attr_high = attr_base;
+      /* -- half 1 -- */
+      int attr_high = attr;
       if (is_cursor && (v->mode == NORMAL || (v->mode == INSERT && v->nibble == 0)))
           attr_high |= A_REVERSE;
 
-      attron(attr_high);
-      addch(HEX[(b >> 4) & 0x0F]);
-      attroff(attr_high);
+      if (pos < max_x)
+        line_buf[pos++] = HEX[(b >> 4) & 0x0F] | attr_high;
 
-      int attr_low = attr_base;
+      /* -- half 2 -- */
+      int attr_low = attr;
       if (is_cursor && (v->mode == NORMAL || (v->mode == INSERT && v->nibble == 1)))
           attr_low |= A_REVERSE;
 
-      attron(attr_low);
-      addch(HEX[b & 0x0F]);
-      attroff(attr_low);
+      if (pos < max_x)
+        line_buf[pos++] = HEX[b & 0x0F] | attr_low;
 
-      addch(' ');
+      /* -- trailing space -- */
+      if (pos < max_x)
+        line_buf[pos++] = ' ';
     }
 
-    addstr("| ");
+    /* -- if end-of-file -- */
+    while (pos < hex_start + 48) {
+      if (pos < max_x)
+        line_buf[pos++] = ' ';
+    }
 
+    /* -- separator -- */
+    if (pos < max_x)
+      line_buf[pos++] = '|';
+    if (pos < max_x)
+      line_buf[pos++] = ' ';
+
+    /* --- ASCII --- */
     for (size_t i = 0; i < bytes; i++) {
+      if (pos >= max_x)
+        break;
+
       size_t idx = lineoff + i;
       unsigned char b = ctx->data[idx];
       int is_cursor = (idx == v->cur);
@@ -212,18 +243,14 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
       if (is_cursor)
         attr |= A_REVERSE;
       
-      attron(attr);
-      if (isprint(b)) {
-        addch(b);
-      } else {
-        if (!is_cursor)
-          attroff(COLOR_PAIR(CP_ASCII));
-        addch('.');
-        if (!is_cursor)
-          attron(COLOR_PAIR(CP_ASCII));
+      chtype c = (isprint(b) ? b : '.') | attr;
+      if (!isprint(b) && !is_cursor) {
+        c = '.' | A_DIM;
       }
-      attroff(attr);
+
+      line_buf[pos++] = c;
     }
+    mvaddchnstr(row, 0, line_buf, max_x);
   }
 
   move(max_y - 2, 0);
@@ -238,13 +265,8 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
 
   if (v->mode == INSERT)
     addstr("| --INSERT-- ");
-
-  if (ctx->changed) {
-    addch('|');
-    attron(COLOR_PAIR(CP_ASCII) | A_BOLD);
-    addstr(" [+]");
-    attroff(COLOR_PAIR(CP_ASCII) | A_BOLD);
-  }
+  if (ctx->changed)
+    addstr("| [+]");
 }
 
 void handle_input(struct editor_ctx *ctx, struct editor_view *v)
@@ -322,15 +344,20 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
           v->want_quit = 1;
         break;
     }
+  }
 
-    if (v->cur >= v->page + ((v->max_y - 2) * 16)) {
-      size_t cur_row_start = (v->cur / 16) * 16;
-      v->page = cur_row_start - ((v->max_y - 3) * 16);
-    }
+  if (v->cur >= v->page + ((v->max_y - 2) * 16)) {
+    size_t cur_row_start = (v->cur / 16) * 16;
+    v->page = cur_row_start - ((v->max_y - 3) * 16);
 
-    if (v->cur < v->page) {
-      v->page = (v->cur / 16) * 16;
+    size_t window_size = (v->max_y - 2) * 16;
+    if (v->page + window_size < ctx->size) {
+      madvise(ctx->data + v->page, window_size, MADV_WILLNEED);
     }
+  }
+
+  if (v->cur < v->page) {
+    v->page = (v->cur / 16) * 16;
   }
 }
 
