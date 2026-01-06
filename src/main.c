@@ -118,6 +118,8 @@ int main(int argc, char *argv[])
     init_pair(CP_NULL,   COLOR_BLUE, COLOR_BLACK);
   }
 
+  set_escdelay(0);
+
   for(;!view.want_quit;) {
     draw_editor(&ctx, &view);
     refresh();
