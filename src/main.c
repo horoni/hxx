@@ -164,12 +164,14 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
     }
 
     /* -- offset -- */
-    char addr_str[16];
-    snprintf(addr_str, 16, "%08zx:", lineoff);
-    for (int i = 0; i < 9; i++)
+    size_t tmpoff = lineoff;
+    for (int i = 8, pos = 8; i > 0; i--, tmpoff >>= 4)
       if (pos < max_x)
-        line_buf[pos++] = addr_str[i];
+        line_buf[pos--] = HEX[tmpoff & 0x0F];
 
+    pos += 9;
+    if (pos < max_x)
+      line_buf[pos++] = ':';
     if (pos < max_x)
       line_buf[pos++] = ' ';
 
