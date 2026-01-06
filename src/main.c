@@ -74,7 +74,7 @@ enum {
 
 void draw_editor(struct editor_ctx *ctx, struct editor_view *v);
 void handle_input(struct editor_ctx *ctx, struct editor_view *v);
-void handle_jump(struct editor_ctx *ctx, struct editor_view *v);
+void handle_command(struct editor_ctx *ctx, struct editor_view *v);
 
 void open_editor(struct editor_ctx *ctx, const char *filename);
 void close_editor(struct editor_ctx *ctx);
@@ -330,22 +330,14 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
         v->mode = INSERT;
         v->nibble = 0;
         break;
-      case ':': /* seek */
-        handle_jump(ctx, v);
-        break;
-      case 'w':
-        flush_data(ctx);
+      case ':': /* command */
+        handle_command(ctx, v);
         break;
       case 'u': /* undo */
         hist_undo(ctx, v);
         break;
       case 18: /* CTRL+R : redo */
         hist_redo(ctx, v);
-        break;
-      case 'q': /* quit */
-        /* print message to user "no write since last change" */
-        if (!ctx->changed)
-          v->want_quit = 1;
         break;
     }
   }
@@ -360,7 +352,7 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
   }
 }
 
-void handle_jump(struct editor_ctx *ctx, struct editor_view *v)
+void handle_command(struct editor_ctx *ctx, struct editor_view *v)
 {
   char buf[64] = {0};
   int pos = 0;
@@ -377,6 +369,7 @@ void handle_jump(struct editor_ctx *ctx, struct editor_view *v)
   curs_set(1);
   refresh();
 
+  nodelay(stdscr, FALSE);
   for (;;) {
     c = getch();
 
@@ -392,31 +385,47 @@ void handle_jump(struct editor_ctx *ctx, struct editor_view *v)
         move(max_y - 1, pos);
         pos--;
       }
-    } else if (pos < 63 && (isalnum(c) || c == 'x')) {
+    } else if (pos < 63) {
       mvaddch(max_y - 1, 1 + pos, c);
       buf[pos++] = c;
     }
     refresh();
   }
+  nodelay(stdscr, TRUE);
 
   curs_set(0);
   if (pos == 0)
     return;
 
-  size_t off = 0;
-  if (buf[0] == 'x')
-    off = strtoull(buf + 1, NULL, 16);
-  else
-    off = strtoull(buf, NULL, 10);
+  if (buf[0] == 'q' && buf[1] == '\0') {
+    /* print message to user "no write since last change" */
+    if (!ctx->changed)
+      v->want_quit = 1;
+  } else if (buf[0] == 'q' && buf[1] == '!' && buf[2] == '\0') {
+    v->want_quit = 1;
+  } else if (buf[0] == 'w' && buf[1] == '\0') {
+    flush_data(ctx);
+  } else if (buf[0] == 'w' && buf[1] == 'q' && buf[2] == '\0') {
+    flush_data(ctx);
+    if (!ctx->changed)
+      v->want_quit = 1;
+  } else {
+    size_t off = 0;
+    if (buf[pos - 1] == 'x') {
+      buf[pos - 1] = '\0';
+      off = strtoull(buf, NULL, 16);
+    } else {
+      off = strtoull(buf, NULL, 10);
+    }
+    if (off >= ctx->size)
+      off = ctx->size - 1;
 
-  if (off >= ctx->size)
-    off = ctx->size - 1;
+    v->cur = off;
+    v->page = (v->cur / 16) * 16;
 
-  v->cur = off;
-  v->page = (v->cur / 16) * 16;
-
-  /* if cursor move to EOF we need to clear garbage on the screen */
-  erase();
+    /* if cursor move to EOF we need to clear garbage on the screen */
+    erase();
+  }
 }
 
 void open_editor(struct editor_ctx *ctx, const char *filename)

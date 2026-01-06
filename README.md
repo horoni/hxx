@@ -5,10 +5,12 @@ lightweight hex editor with vim-like controls
  - j - down
  - k - up
  - l - right
- - : - jump to offset ( if the first char is `x` then offset is hex)
  - i - insert
- - w - flush cache to disk
- - q - quit
  - u - undo
  - ESC - return to normal mode
  - ctrl+r - redo
+ - : - jump to offset ( if the last char is `x` then offset is hex)
+ - :w - flush cache to disk
+ - :wq - flush cache to disk and quit
+ - :q - quit
+ - :q! - quit without writing (currently doesnt work, need to undo history before exit or dont call msync)
