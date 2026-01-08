@@ -12,7 +12,7 @@ CC       := gcc
 AS       := as
 WARNINGS := -Wall -Wextra -Wpedantic
 CFLAGS   := $(WARNINGS) -std=gnu99 -Iinclude/ -O3
-LDFLAGS  += -lcurses -flto
+LDFLAGS  += -flto
 
 ifeq ($(MSAN),1)
 $(info [SAN] MSan enabled)
