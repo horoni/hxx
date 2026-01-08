@@ -26,7 +26,6 @@
 #include <assert.h>
 #include <ctype.h>
 #include <fcntl.h>
-#include <ncurses.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,10 +35,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define CP_OFFSET 1
-#define CP_HEX    2
-#define CP_ASCII  3
-#define CP_NULL   4
+#include "termbox2.h"
+
+#define CL_HEX    TB_WHITE
+#define CL_ASCII  TB_GREEN
+#define CL_NULL   TB_BLUE
 
 typedef struct action {
   size_t off;
@@ -58,13 +58,12 @@ struct editor_ctx {
 };
 
 struct editor_view {
-  int max_y, max_x;
+  int h, w;
   int want_quit;
   size_t cur; /* cursor */
   size_t page;
   int mode;
   int nibble;
-  int c; /* pressed char */
   uint8_t snap;
 };
 
@@ -74,7 +73,7 @@ enum {
 };
 
 void draw_editor(struct editor_ctx *ctx, struct editor_view *v);
-void handle_input(struct editor_ctx *ctx, struct editor_view *v);
+void handle_input(struct editor_ctx *ctx, struct editor_view *v, struct tb_event *ev);
 void handle_command(struct editor_ctx *ctx, struct editor_view *v);
 
 void open_editor(struct editor_ctx *ctx, const char *filename);
@@ -95,7 +94,7 @@ int main(int argc, char *argv[])
 {
   struct editor_ctx ctx;
   struct editor_view view;
-  int c;
+  struct tb_event ev;
 
   if (argc < 2)
     return 1;
@@ -106,38 +105,25 @@ int main(int argc, char *argv[])
   hist_init(&ctx);
   open_editor(&ctx, argv[1]);
 
-  initscr();
-  noecho();
-  curs_set(0);
-
-  if (has_colors()) {
-    start_color();
-    /*                   Foreground, Background */
-    init_pair(CP_OFFSET, COLOR_CYAN, COLOR_BLACK);
-    init_pair(CP_HEX,    COLOR_WHITE, COLOR_BLACK);
-    init_pair(CP_ASCII,  COLOR_GREEN, COLOR_BLACK);
-    init_pair(CP_NULL,   COLOR_BLUE, COLOR_BLACK);
-  }
-
-  set_escdelay(0);
+  tb_init();
 
   for(;!view.want_quit;) {
+    view.h = tb_height();
+    view.w = tb_width();
     draw_editor(&ctx, &view);
-    refresh();
 
-    view.c = getch();
-    getmaxyx(stdscr, view.max_y, view.max_x);
-    handle_input(&ctx, &view);
+    tb_poll_event(&ev);
+    if (ev.type == TB_EVENT_RESIZE)
+      continue;
 
-    nodelay(stdscr, TRUE);
-    while ((c = getch()) != ERR) {
-      view.c = c;
-      handle_input(&ctx, &view);
+    handle_input(&ctx, &view, &ev);
+    while (!tb_peek_event(&ev, 0)) {
+      handle_input(&ctx, &view, &ev);
     }
-    nodelay(stdscr, FALSE);
   }
 
-  endwin();
+  tb_shutdown();
+
   hist_free(&ctx);
   close_editor(&ctx);
 
@@ -147,42 +133,34 @@ int main(int argc, char *argv[])
 void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
 {
   static const char HEX[] = "0123456789abcdef";
-  int max_y, max_x;
+  int h, w;
 
-  getmaxyx(stdscr, max_y, max_x);
+  h = v->h;
+  w = v->w;
 
-  chtype line_buf[max_x + 1];
-
-  for (int row = 0; row < max_y - 2; row++) {
+  for (int row = 0; row < h - 2; row++) {
     size_t lineoff = v->page + (row * 16);
-    int pos = 0;
-
-    for(int i = 0; i < max_x; i++)
-      line_buf[i] = ' ';
-    line_buf[max_x] = '\0';
+    int x = 0;
 
     if (lineoff >= ctx->size) {
-      mvaddstr(row, 0, "~~");
+      tb_set_cell(0, row, '~', TB_BLUE, TB_BLACK);
       break;
     }
 
     /* -- offset -- */
     size_t tmpoff = lineoff;
-    for (int i = 8, pos = 8; i > 0; i--, tmpoff >>= 4)
-      if (pos < max_x)
-        line_buf[pos--] = HEX[tmpoff & 0x0F];
+    for (int i = 8, x = 8; i > 0; i--, tmpoff >>= 4)
+      tb_set_cell(x--, row, HEX[tmpoff & 0x0F], TB_WHITE, TB_BLACK);
 
-    pos += 9;
-    if (pos < max_x)
-      line_buf[pos++] = ':';
-    if (pos < max_x)
-      line_buf[pos++] = ' ';
+    x += 9;
+    tb_print(x, row, TB_WHITE, TB_BLACK, ": ");
+    x += 2;
 
     size_t bytes = 16;
     if (lineoff + 16 > ctx->size)
       bytes = ctx->size - lineoff;
 
-    int hex_start = pos;
+    int hex_start = x;
 
     /* --- HEX --- */
     for (size_t i = 0; i < 16; i++) {
@@ -196,88 +174,77 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
       int is_print = isprint(b);
 
       /* -- base attr -- */
-      int attr = COLOR_PAIR(CP_HEX);
+      uintattr_t fg = CL_HEX;
+      uintattr_t bg = TB_BLACK;
       if (b == 0x00)
-        attr = COLOR_PAIR(CP_NULL) | A_DIM;
+        fg = CL_NULL;
       if (is_print)
-        attr = COLOR_PAIR(CP_ASCII);
+        fg = CL_ASCII;
 
-      /* -- half 1 -- */
-      int attr_high = attr;
-      if (is_cursor && (v->mode == NORMAL || (v->mode == INSERT && v->nibble == 0)))
-          attr_high |= A_REVERSE;
+      /* -- half bytes attr -- */
+      uintattr_t fg_h1 = fg, bg_h1 = bg;
+      uintattr_t fg_h2 = fg, bg_h2 = bg;
 
-      if (pos < max_x)
-        line_buf[pos++] = HEX[(b >> 4) & 0x0F] | attr_high;
+      if (is_cursor) {
+        if (v->mode == NORMAL) {
+          bg_h1 = bg_h2 = TB_REVERSE;
+        } else {
+          if (v->nibble == 0)
+            bg_h1 = TB_REVERSE;
+          else
+            bg_h2 = TB_REVERSE;
+        }
+      }
 
-      /* -- half 2 -- */
-      int attr_low = attr;
-      if (is_cursor && (v->mode == NORMAL || (v->mode == INSERT && v->nibble == 1)))
-          attr_low |= A_REVERSE;
-
-      if (pos < max_x)
-        line_buf[pos++] = HEX[b & 0x0F] | attr_low;
-
-      /* -- trailing space -- */
-      if (pos < max_x)
-        line_buf[pos++] = ' ';
+      /* -- half bytes draw! -- */
+      tb_set_cell(x++, row, HEX[(b >> 4) & 0x0F], fg_h1, bg_h1);
+      tb_set_cell(x++, row, HEX[b & 0x0F], fg_h2, bg_h2);
+      tb_set_cell(x++, row, ' ', TB_DEFAULT, TB_DEFAULT);
     }
 
     /* -- if end-of-file -- */
-    while (pos < hex_start + 48) {
-      if (pos < max_x)
-        line_buf[pos++] = ' ';
+    while (x < hex_start + 48) {
+      tb_set_cell(x++, row, ' ', TB_DEFAULT, TB_DEFAULT);
     }
 
     /* -- separator -- */
-    if (pos < max_x)
-      line_buf[pos++] = '|';
-    if (pos < max_x)
-      line_buf[pos++] = ' ';
+    tb_set_cell(x++, row, '|', TB_DEFAULT, TB_DEFAULT);
+    tb_set_cell(x++, row, ' ', TB_DEFAULT, TB_DEFAULT);
 
     /* --- ASCII --- */
     for (size_t i = 0; i < bytes; i++) {
-      if (pos >= max_x)
-        break;
-
       size_t idx = lineoff + i;
       unsigned char b = ctx->data[idx];
       int is_cursor = (idx == v->cur);
 
-      int attr = COLOR_PAIR(CP_ASCII);
+      uintattr_t fg = CL_ASCII;
+      uintattr_t bg = TB_BLACK;
+      if (!isprint(b))
+        fg = CL_NULL;
       if (is_cursor)
-        attr |= A_REVERSE;
-      
-      chtype c = (isprint(b) ? b : '.') | attr;
-      if (!isprint(b) && !is_cursor) {
-        c = '.' | A_DIM;
-      }
+        bg = TB_REVERSE;
 
-      line_buf[pos++] = c;
+      uint32_t c = isprint(b) ? b : '.';
+      tb_set_cell(x++, row, c, fg, bg);
     }
-    mvaddchnstr(row, 0, line_buf, max_x);
   }
 
-  move(max_y - 2, 0);
-  attron(A_REVERSE);
-  for (int i = 0; i < max_x; i++)
-    addch(' ');
-  attroff(A_REVERSE);
+  for (int i = 0; i < w; i++)
+    tb_set_cell(i, h - 2, ' ', TB_DEFAULT, TB_REVERSE);
+  for (int i = 0; i < w; i++)
+    tb_set_cell(i, h - 1, ' ', TB_DEFAULT, TB_DEFAULT);
+  tb_printf(0, h - 1, TB_BOLD, TB_DEFAULT, "POS: %08zx | HEX: %02x | DEC: %3d %s %s",
+      v->cur, ctx->data[v->cur], ctx->data[v->cur],
+      v->mode == INSERT ? "| --INSERT--" : "| NORMAL",
+      ctx->changed ? "| [+]" : "");
 
-  move(max_y - 1, 0);
-  clrtoeol();
-  printw("POS: %08zx | VAL: %02x | DEC: %3d ", v->cur, ctx->data[v->cur], ctx->data[v->cur]);
-
-  if (v->mode == INSERT)
-    addstr("| --INSERT-- ");
-  if (ctx->changed)
-    addstr("| [+]");
+  tb_present();
 }
 
-void handle_input(struct editor_ctx *ctx, struct editor_view *v)
+void handle_input(struct editor_ctx *ctx, struct editor_view *v, struct tb_event *ev)
 {
   if (v->mode == INSERT) {
-    if (v->c == 27) {
+    if (ev->key == TB_KEY_ESC) {
       if (v->nibble == 1) {
         hist_add_smart(ctx, v->cur, v->snap);
         v->nibble = 0;
@@ -286,8 +253,8 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
       return;
     }
 
-    if (isxdigit(v->c)) {
-      char hex_str[2] = {v->c, '\0'};
+    if (isxdigit(ev->ch)) {
+      char hex_str[2] = {ev->ch, '\0'};
       uint8_t nib = (uint8_t)strtol(hex_str, NULL, 16);
       uint8_t cur_byte = ctx->data[v->cur];
       uint8_t new_byte;
@@ -308,7 +275,7 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
     }
   } else {
     long long cursor = v->cur;
-    switch (v->c) {
+    switch (ev->ch) {
       case 'h': /* left */
         if (cursor - 1 >= 0) v->cur -= 1;
         break;
@@ -337,15 +304,17 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
       case 'u': /* undo */
         hist_undo(ctx, v);
         break;
-      case 18: /* CTRL+R : redo */
+    }
+    switch (ev->key) {
+      case TB_KEY_CTRL_R: /* redo */
         hist_redo(ctx, v);
         break;
     }
   }
 
-  if (v->cur >= v->page + ((v->max_y - 2) * 16)) {
+  if (v->cur >= v->page + ((v->h - 2) * 16)) {
     size_t cur_row_start = (v->cur / 16) * 16;
-    v->page = cur_row_start - ((v->max_y - 3) * 16);
+    v->page = cur_row_start - ((v->h - 3) * 16);
   }
 
   if (v->cur < v->page) {
@@ -355,46 +324,39 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v)
 
 void handle_command(struct editor_ctx *ctx, struct editor_view *v)
 {
+  struct tb_event ev;
   char buf[64] = {0};
   int pos = 0;
-  int max_y;
-  int c;
+  int h;
 
-  max_y = getmaxy(stdscr);
+  h = tb_height();
+  for (int x = 1; x < tb_width(); x++)
+    tb_set_cell(x, h - 1, ' ', TB_DEFAULT, TB_DEFAULT);
+  tb_set_cell(0, h - 1, ':', TB_DEFAULT, TB_DEFAULT);
+  tb_set_cursor(1, h - 1);
+  tb_present();
 
-  attron(A_BOLD);
-  mvprintw(max_y - 1, 0, ":");
-  clrtoeol();
-  attroff(A_BOLD);
-
-  curs_set(1);
-  refresh();
-
-  nodelay(stdscr, FALSE);
   for (;;) {
-    c = getch();
+    tb_poll_event(&ev);
 
-    if (c == '\n') {
-      break;
-    } else if (c == 27) {
-      curs_set(0);
-      return;
-    } else if (c == KEY_BACKSPACE || c == 127 || c == '\b') {
-      if (pos > 0) {
-        buf[pos - 1] = '\0';
-        mvaddch(max_y - 1, pos, ' ');
-        move(max_y - 1, pos);
-        pos--;
-      }
-    } else if (pos < 63) {
-      mvaddch(max_y - 1, 1 + pos, c);
-      buf[pos++] = c;
+    if (ev.type == TB_EVENT_KEY) {
+      if (ev.key == TB_KEY_ESC)
+        goto clline;
+      if (ev.key == TB_KEY_ENTER)
+        break;
+      if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2)
+        if (pos > 0)
+          buf[--pos] = '\0';
+      if (ev.ch && pos < 63)
+        buf[pos++] = ev.ch;
     }
-    refresh();
+    for (int x = 1; x < tb_width(); x++)
+      tb_set_cell(x, h - 1, ' ', TB_DEFAULT, TB_DEFAULT);
+    tb_printf(0, h - 1, TB_DEFAULT, TB_DEFAULT, ":%s", buf);
+    tb_set_cursor(1 + pos, h - 1);
+    tb_present();
   }
-  nodelay(stdscr, TRUE);
 
-  curs_set(0);
   if (pos == 0)
     return;
 
@@ -425,8 +387,12 @@ void handle_command(struct editor_ctx *ctx, struct editor_view *v)
     v->page = (v->cur / 16) * 16;
 
     /* if cursor move to EOF we need to clear garbage on the screen */
-    erase();
+    tb_clear();
   }
+clline:
+  tb_hide_cursor();
+  for (int x = 0; x < tb_width(); x++)
+    tb_set_cell(x, h - 1, ' ', TB_DEFAULT, TB_DEFAULT);
 }
 
 void open_editor(struct editor_ctx *ctx, const char *filename)
