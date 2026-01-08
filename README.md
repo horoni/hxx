@@ -1,5 +1,13 @@
 ## hxx
 lightweight hex editor with vim-like controls
+### build
+```
+make install
+```
+or for MMAP backend (Linux only)
+```
+make install USE_MMAP=1
+```
 ### how to use
  - h - left
  - j - down

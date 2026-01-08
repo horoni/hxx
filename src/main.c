@@ -54,7 +54,17 @@ struct data_ctx {
   size_t size;
   int changed;
   char *path;
+#ifdef USE_MMAP
   unsigned char *data;
+#else
+  /* buffer size 4 KiB */
+  #define BUF_SIZ (1024 * 4)
+  FILE *fp;
+  uint8_t buf[BUF_SIZ];
+  size_t buf_off;
+  size_t buf_len;
+  uint8_t buf_changed;
+#endif
 };
 
 struct editor_view {
@@ -82,7 +92,7 @@ void draw_editor(struct editor_ctx *ctx);
 void handle_input(struct editor_ctx *ctx, struct tb_event *ev);
 void handle_command(struct editor_ctx *ctx);
 
-void data_open(struct data_ctx *ctx, const char *filename);
+int data_open(struct data_ctx *ctx, const char *path);
 void data_close(struct data_ctx *ctx);
 void data_flush(struct data_ctx *ctx);
 uint8_t data_read(struct data_ctx *ctx, size_t off);
@@ -113,7 +123,8 @@ int main(int argc, char *argv[])
   ctx.data = &data;
 
   hist_init(&ctx);
-  data_open(&data, argv[1]);
+  if (data_open(&data, argv[1]))
+    return 1;
 
   tb_init();
 
@@ -507,19 +518,21 @@ void hist_redo(struct editor_ctx *ctx)
   ctx->v->cur = act->off;
 }
 
-void data_open(struct data_ctx *ctx, const char *filename)
+#ifdef USE_MMAP
+
+int data_open(struct data_ctx *ctx, const char *path)
 {
   struct stat st;
 
-  ctx->fd = open(filename, O_RDWR);
+  ctx->fd = open(path, O_RDWR);
   if (ctx->fd < 0) {
     perror("open() failed");
-    exit(1);
+    return 1;
   }
 
   if (fstat(ctx->fd, &st) < 0) {
     perror("fstat() failed");
-    exit(1);
+    return 1;
   }
 
   ctx->size = st.st_size;
@@ -527,18 +540,20 @@ void data_open(struct data_ctx *ctx, const char *filename)
 
   if (ctx->size == 0) {
     fprintf(stderr, "cant map empty file\n");
-    exit(1);
+    return 1;
   }
 
   ctx->data = mmap(NULL, ctx->size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->fd, 0);
   if (ctx->data == MAP_FAILED) {
     perror("mmap() failed");
-    exit(1);
+    return 1;
   }
 
   if (madvise(ctx->data, ctx->size, MADV_SEQUENTIAL) < 0) {
     perror("madvise failed");
   }
+
+  return 0;
 }
 
 void data_close(struct data_ctx *ctx)
@@ -598,3 +613,95 @@ void data_write(struct data_ctx *ctx, size_t off, uint8_t new)
   ctx->changed = 1;
 }
 
+#else
+
+void _flush_buf(struct data_ctx *ctx)
+{
+  if (!ctx->buf_changed || !ctx->fp)
+    return;
+
+  fseek(ctx->fp, ctx->buf_off, SEEK_SET);
+  fwrite(ctx->buf, sizeof(uint8_t), ctx->buf_len, ctx->fp);
+  fflush(ctx->fp);
+  ctx->buf_changed = 0;
+}
+
+void _load_chunk(struct data_ctx *ctx, uint64_t off)
+{
+  if (!ctx->fp)
+    return;
+
+  _flush_buf(ctx);
+
+  ctx->buf_off = (off / BUF_SIZ) * BUF_SIZ;
+  fseek(ctx->fp, ctx->buf_off, SEEK_SET);
+  ctx->buf_len = fread(ctx->buf, sizeof(uint8_t), BUF_SIZ, ctx->fp);
+}
+
+int data_open(struct data_ctx *ctx, const char *path)
+{
+  ctx->fp = fopen(path, "rb+");
+  if (!ctx->fp)
+    return 1;
+
+  if (fseek(ctx->fp, 0, SEEK_END) < 0)
+    goto err;
+
+  long size;
+  if ((size = ftell(ctx->fp)) < 0)
+    goto err;
+
+  ctx->size = size;
+  ctx->changed = 0;
+  ctx->buf_off = -1;
+  ctx->buf_len = 0;
+  ctx->buf_changed = 0;
+
+  /* has same lifetime as program. yes? */
+  ctx->path = (char *)path;
+
+  return 0;
+err:
+  fclose(ctx->fp);
+  return 1;
+}
+
+void data_close(struct data_ctx *ctx)
+{
+  if (!ctx->fp)
+    return;
+
+  fclose(ctx->fp);
+}
+
+void data_flush(struct data_ctx *ctx)
+{
+  _flush_buf(ctx);
+  ctx->changed = 0;
+}
+
+uint8_t data_read(struct data_ctx *ctx, size_t off)
+{
+  if (off >= ctx->size)
+    return 0;
+
+  if (off < ctx->buf_off || off >= ctx->buf_off + ctx->buf_len)
+    _load_chunk(ctx, off);
+
+  return ctx->buf[off - ctx->buf_off];
+}
+
+void data_write(struct data_ctx *ctx, size_t off, uint8_t new)
+{
+  if (off >= ctx->size)
+    return;
+
+  if (off < ctx->buf_off || off >= ctx->buf_off + ctx->buf_len)
+    _load_chunk(ctx, off);
+
+  ctx->buf[off - ctx->buf_off] = new;
+  ctx->buf_changed = 1;
+  ctx->changed = 1;
+}
+
+#endif

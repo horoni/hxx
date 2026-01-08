@@ -14,6 +14,10 @@ WARNINGS := -Wall -Wextra -Wpedantic
 CFLAGS   := $(WARNINGS) -std=gnu99 -Iinclude/ -O3
 LDFLAGS  += -flto
 
+ifeq ($(USE_MMAP),1)
+CFLAGS += -DUSE_MMAP
+endif
+
 ifeq ($(MSAN),1)
 $(info [SAN] MSan enabled)
 CFLAGS  += -g -fPIE -fsanitize=memory -fno-omit-frame-pointer
