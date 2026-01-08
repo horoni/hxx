@@ -49,12 +49,12 @@ typedef struct action {
   struct action *next;
 } __attribute__((packed)) action_t;
 
-struct editor_ctx {
+struct data_ctx {
   int fd;
   size_t size;
-  unsigned char *data;
   int changed;
-  action_t *hist; /* head */
+  char *path;
+  unsigned char *data;
 };
 
 struct editor_view {
@@ -67,33 +67,39 @@ struct editor_view {
   uint8_t snap;
 };
 
+struct editor_ctx {
+  struct data_ctx *data;
+  struct editor_view *v;
+  action_t *hist; /* head */
+};
+
 enum {
   NORMAL,
   INSERT,
 };
 
-void draw_editor(struct editor_ctx *ctx, struct editor_view *v);
-void handle_input(struct editor_ctx *ctx, struct editor_view *v, struct tb_event *ev);
-void handle_command(struct editor_ctx *ctx, struct editor_view *v);
+void draw_editor(struct editor_ctx *ctx);
+void handle_input(struct editor_ctx *ctx, struct tb_event *ev);
+void handle_command(struct editor_ctx *ctx);
 
-void open_editor(struct editor_ctx *ctx, const char *filename);
-void close_editor(struct editor_ctx *ctx);
-void flush_data(struct editor_ctx *ctx);
-void extend_file(struct editor_ctx *ctx, size_t siz);
-
-void write_byte(struct editor_ctx *ctx, size_t off, uint8_t new);
+void data_open(struct data_ctx *ctx, const char *filename);
+void data_close(struct data_ctx *ctx);
+void data_flush(struct data_ctx *ctx);
+uint8_t data_read(struct data_ctx *ctx, size_t off);
+void data_write(struct data_ctx *ctx, size_t off, uint8_t new);
 
 void hist_init(struct editor_ctx *ctx);
 void hist_free(struct editor_ctx *ctx);
 void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new);
 void hist_add_smart(struct editor_ctx *ctx, size_t off, uint8_t old);
-void hist_undo(struct editor_ctx *ctx, struct editor_view *v);
-void hist_redo(struct editor_ctx *ctx, struct editor_view *v);
+void hist_undo(struct editor_ctx *ctx);
+void hist_redo(struct editor_ctx *ctx);
 
 int main(int argc, char *argv[])
 {
   struct editor_ctx ctx;
   struct editor_view view;
+  struct data_ctx data;
   struct tb_event ev;
 
   if (argc < 2)
@@ -101,38 +107,43 @@ int main(int argc, char *argv[])
 
   memset(&ctx, 0, sizeof(ctx));
   memset(&view, 0, sizeof(view));
+  memset(&data, 0, sizeof(data));
+
+  ctx.v = &view;
+  ctx.data = &data;
 
   hist_init(&ctx);
-  open_editor(&ctx, argv[1]);
+  data_open(&data, argv[1]);
 
   tb_init();
 
   for(;!view.want_quit;) {
     view.h = tb_height();
     view.w = tb_width();
-    draw_editor(&ctx, &view);
+    draw_editor(&ctx);
 
     tb_poll_event(&ev);
     if (ev.type == TB_EVENT_RESIZE)
       continue;
 
-    handle_input(&ctx, &view, &ev);
+    handle_input(&ctx, &ev);
     while (!tb_peek_event(&ev, 0)) {
-      handle_input(&ctx, &view, &ev);
+      handle_input(&ctx, &ev);
     }
   }
 
   tb_shutdown();
 
   hist_free(&ctx);
-  close_editor(&ctx);
+  data_close(&data);
 
   return 0;
 }
 
-void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
+void draw_editor(struct editor_ctx *ctx)
 {
   static const char HEX[] = "0123456789abcdef";
+  struct editor_view *v = ctx->v;
   int h, w;
 
   h = v->h;
@@ -142,7 +153,7 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
     size_t lineoff = v->page + (row * 16);
     int x = 0;
 
-    if (lineoff >= ctx->size) {
+    if (lineoff >= ctx->data->size) {
       tb_set_cell(0, row, '~', TB_BLUE, TB_BLACK);
       break;
     }
@@ -157,8 +168,8 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
     x += 2;
 
     size_t bytes = 16;
-    if (lineoff + 16 > ctx->size)
-      bytes = ctx->size - lineoff;
+    if (lineoff + 16 > ctx->data->size)
+      bytes = ctx->data->size - lineoff;
 
     int hex_start = x;
 
@@ -168,7 +179,7 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
         break;
 
       size_t idx = lineoff + i;
-      unsigned char b = ctx->data[idx];
+      uint8_t b = data_read(ctx->data, idx);
 
       int is_cursor = (idx == v->cur);
       int is_print = isprint(b);
@@ -214,7 +225,7 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
     /* --- ASCII --- */
     for (size_t i = 0; i < bytes; i++) {
       size_t idx = lineoff + i;
-      unsigned char b = ctx->data[idx];
+      uint8_t b = data_read(ctx->data, idx);
       int is_cursor = (idx == v->cur);
 
       uintattr_t fg = CL_ASCII;
@@ -234,15 +245,16 @@ void draw_editor(struct editor_ctx *ctx, struct editor_view *v)
   for (int i = 0; i < w; i++)
     tb_set_cell(i, h - 1, ' ', TB_DEFAULT, TB_DEFAULT);
   tb_printf(0, h - 1, TB_BOLD, TB_DEFAULT, "POS: %08zx | HEX: %02x | DEC: %3d %s %s",
-      v->cur, ctx->data[v->cur], ctx->data[v->cur],
+      v->cur, data_read(ctx->data, v->cur), data_read(ctx->data, v->cur),
       v->mode == INSERT ? "| --INSERT--" : "| NORMAL",
-      ctx->changed ? "| [+]" : "");
+      ctx->data->changed ? "| [+]" : "");
 
   tb_present();
 }
 
-void handle_input(struct editor_ctx *ctx, struct editor_view *v, struct tb_event *ev)
+void handle_input(struct editor_ctx *ctx, struct tb_event *ev)
 {
+  struct editor_view *v = ctx->v;
   if (v->mode == INSERT) {
     if (ev->key == TB_KEY_ESC) {
       if (v->nibble == 1) {
@@ -256,20 +268,20 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v, struct tb_event
     if (isxdigit(ev->ch)) {
       char hex_str[2] = {ev->ch, '\0'};
       uint8_t nib = (uint8_t)strtol(hex_str, NULL, 16);
-      uint8_t cur_byte = ctx->data[v->cur];
+      uint8_t cur_byte = data_read(ctx->data, v->cur);
       uint8_t new_byte;
 
       if (v->nibble == 0) {
         v->snap = cur_byte;
         new_byte = (nib << 4) | (cur_byte & 0x0F);
-        write_byte(ctx, v->cur, new_byte);
+        data_write(ctx->data, v->cur, new_byte);
         v->nibble = 1;
       } else {
         new_byte = nib | (cur_byte & 0xF0);
-        write_byte(ctx, v->cur, new_byte);
+        data_write(ctx->data, v->cur, new_byte);
         hist_add_smart(ctx, v->cur, v->snap);
         v->nibble = 0;
-        if (v->cur + 1 < ctx->size)
+        if (v->cur + 1 < ctx->data->size)
           v->cur++;
       }
     }
@@ -280,10 +292,10 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v, struct tb_event
         if (cursor - 1 >= 0) v->cur -= 1;
         break;
       case 'j': /* down */ 
-        if (cursor + 16 < ctx->size)
+        if (cursor + 16 < ctx->data->size)
           v->cur += 16;
         else
-          v->cur = ctx->size - 1;
+          v->cur = ctx->data->size - 1;
         break;
       case 'k': /* up */
         if (cursor - 16 >= 0)
@@ -292,22 +304,23 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v, struct tb_event
           v->cur = 0;
         break;
       case 'l': /* right */
-        if (cursor + 1 < ctx->size) v->cur += 1;
+        if (cursor + 1 < ctx->data->size)
+          v->cur += 1;
         break;
       case 'i': /* insert */
         v->mode = INSERT;
         v->nibble = 0;
         break;
       case ':': /* command */
-        handle_command(ctx, v);
+        handle_command(ctx);
         break;
       case 'u': /* undo */
-        hist_undo(ctx, v);
+        hist_undo(ctx);
         break;
     }
     switch (ev->key) {
       case TB_KEY_CTRL_R: /* redo */
-        hist_redo(ctx, v);
+        hist_redo(ctx);
         break;
     }
   }
@@ -322,8 +335,9 @@ void handle_input(struct editor_ctx *ctx, struct editor_view *v, struct tb_event
   }
 }
 
-void handle_command(struct editor_ctx *ctx, struct editor_view *v)
+void handle_command(struct editor_ctx *ctx)
 {
+  struct editor_view *v = ctx->v;
   struct tb_event ev;
   char buf[64] = {0};
   int pos = 0;
@@ -362,15 +376,15 @@ void handle_command(struct editor_ctx *ctx, struct editor_view *v)
 
   if (buf[0] == 'q' && buf[1] == '\0') {
     /* print message to user "no write since last change" */
-    if (!ctx->changed)
+    if (!ctx->data->changed)
       v->want_quit = 1;
   } else if (buf[0] == 'q' && buf[1] == '!' && buf[2] == '\0') {
     v->want_quit = 1;
   } else if (buf[0] == 'w' && buf[1] == '\0') {
-    flush_data(ctx);
+    data_flush(ctx->data);
   } else if (buf[0] == 'w' && buf[1] == 'q' && buf[2] == '\0') {
-    flush_data(ctx);
-    if (!ctx->changed)
+    data_flush(ctx->data);
+    if (!ctx->data->changed)
       v->want_quit = 1;
   } else {
     size_t off = 0;
@@ -380,8 +394,8 @@ void handle_command(struct editor_ctx *ctx, struct editor_view *v)
     } else {
       off = strtoull(buf, NULL, 10);
     }
-    if (off >= ctx->size)
-      off = ctx->size - 1;
+    if (off >= ctx->data->size)
+      off = ctx->data->size - 1;
 
     v->cur = off;
     v->page = (v->cur / 16) * 16;
@@ -395,80 +409,7 @@ clline:
     tb_set_cell(x, h - 1, ' ', TB_DEFAULT, TB_DEFAULT);
 }
 
-void open_editor(struct editor_ctx *ctx, const char *filename)
-{
-  struct stat st;
-
-  ctx->fd = open(filename, O_RDWR);
-  if (ctx->fd < 0) {
-    perror("open() failed");
-    exit(1);
-  }
-
-  if (fstat(ctx->fd, &st) < 0) {
-    perror("fstat() failed");
-    exit(1);
-  }
-
-  ctx->size = st.st_size;
-  ctx->changed = 0;
-
-  if (ctx->size == 0) {
-    fprintf(stderr, "cant map empty file\n");
-    exit(1);
-  }
-
-  ctx->data = mmap(NULL, ctx->size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->fd, 0);
-  if (ctx->data == MAP_FAILED) {
-    perror("mmap() failed");
-    exit(1);
-  }
-
-  if (madvise(ctx->data, ctx->size, MADV_SEQUENTIAL) < 0) {
-    perror("madvise failed");
-  }
-}
-
-void close_editor(struct editor_ctx *ctx)
-{
-  if (!ctx)
-    return;
-
-  if (ctx->data != NULL && ctx->data != MAP_FAILED) {
-    if (msync(ctx->data, ctx->size, MS_SYNC) < 0) {
-      perror("msync() failed (data lost?)");
-      // TODO: Retry
-    }
-    if (munmap(ctx->data, ctx->size) < 0) {
-      perror("munmap() failed");
-    }
-  }
-
-  if (ctx->fd != -1) {
-    if (close(ctx->fd) < 0) {
-      perror("close() failed");
-    }
-  }
-
-  ctx->fd = -1;
-  ctx->size = 0;
-  ctx->data = NULL;
-  ctx->changed = 0;
-}
-
-void flush_data(struct editor_ctx *ctx)
-{
-  if (!ctx->changed)
-    return;
-
-  if (msync(ctx->data, ctx->size, MS_SYNC) < 0) {
-    perror("msync() failed");
-    // TODO: Print to status-bar
-  } else {
-    ctx->changed = 0;
-  }
-}
-
+/*
 void extend_file(struct editor_ctx *ctx, size_t siz)
 {
   void *new_data;
@@ -491,15 +432,7 @@ void extend_file(struct editor_ctx *ctx, size_t siz)
   ctx->data = new_data;
   ctx->size = siz;
 }
-
-void write_byte(struct editor_ctx *ctx, size_t off, uint8_t new)
-{
-  if (off >= ctx->size)
-    return;
-
-  ctx->data[off] = new;
-  ctx->changed = 1;
-}
+*/
 
 void hist_init(struct editor_ctx *ctx)
 {
@@ -544,34 +477,124 @@ void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new)
 
 void hist_add_smart(struct editor_ctx *ctx, size_t off, uint8_t old)
 {
-  uint8_t new = ctx->data[off];
+  uint8_t new = data_read(ctx->data, off);
   if (new != old)
     hist_add(ctx, off, old, new);
 }
 
-void hist_undo(struct editor_ctx *ctx, struct editor_view *v)
+void hist_undo(struct editor_ctx *ctx)
 {
   if (!ctx->hist->prev)
     return;
 
   action_t *act = ctx->hist;
 
-  ctx->data[act->off] = act->old_val;
+  data_write(ctx->data, act->off, act->old_val);
   ctx->hist = act->prev;
-  ctx->changed = 1;
 
-  v->cur = act->off;
+  ctx->v->cur = act->off;
 }
 
-void hist_redo(struct editor_ctx *ctx, struct editor_view *v)
+void hist_redo(struct editor_ctx *ctx)
 {
   if (!ctx->hist->next)
     return;
 
   action_t *act = ctx->hist->next;
-  ctx->data[act->off] = act->new_val;
+  data_write(ctx->data, act->off, act->new_val);
   ctx->hist = act;
-  ctx->changed = 1;
 
-  v->cur = act->off;
+  ctx->v->cur = act->off;
 }
+
+void data_open(struct data_ctx *ctx, const char *filename)
+{
+  struct stat st;
+
+  ctx->fd = open(filename, O_RDWR);
+  if (ctx->fd < 0) {
+    perror("open() failed");
+    exit(1);
+  }
+
+  if (fstat(ctx->fd, &st) < 0) {
+    perror("fstat() failed");
+    exit(1);
+  }
+
+  ctx->size = st.st_size;
+  ctx->changed = 0;
+
+  if (ctx->size == 0) {
+    fprintf(stderr, "cant map empty file\n");
+    exit(1);
+  }
+
+  ctx->data = mmap(NULL, ctx->size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->fd, 0);
+  if (ctx->data == MAP_FAILED) {
+    perror("mmap() failed");
+    exit(1);
+  }
+
+  if (madvise(ctx->data, ctx->size, MADV_SEQUENTIAL) < 0) {
+    perror("madvise failed");
+  }
+}
+
+void data_close(struct data_ctx *ctx)
+{
+  if (!ctx)
+    return;
+
+  if (ctx->data != NULL && ctx->data != MAP_FAILED) {
+    if (msync(ctx->data, ctx->size, MS_SYNC) < 0) {
+      perror("msync() failed (data lost?)");
+      // TODO: Retry
+    }
+    if (munmap(ctx->data, ctx->size) < 0) {
+      perror("munmap() failed");
+    }
+  }
+
+  if (ctx->fd != -1) {
+    if (close(ctx->fd) < 0) {
+      perror("close() failed");
+    }
+  }
+
+  ctx->fd = -1;
+  ctx->size = 0;
+  ctx->data = NULL;
+  ctx->changed = 0;
+}
+
+void data_flush(struct data_ctx *ctx)
+{
+  if (!ctx->changed)
+    return;
+
+  if (msync(ctx->data, ctx->size, MS_SYNC) < 0) {
+    perror("msync() failed");
+    // TODO: Print to status-bar
+  } else {
+    ctx->changed = 0;
+  }
+}
+
+uint8_t data_read(struct data_ctx *ctx, size_t off)
+{
+  if (off >= ctx->size)
+    return 0;
+  return ctx->data[off];
+}
+
+
+void data_write(struct data_ctx *ctx, size_t off, uint8_t new)
+{
+  if (off >= ctx->size)
+    return;
+
+  ctx->data[off] = new;
+  ctx->changed = 1;
+}
+
