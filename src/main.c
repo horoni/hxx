@@ -33,6 +33,7 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "termbox2.h"
@@ -41,13 +42,24 @@
 #define CL_ASCII  TB_GREEN
 #define CL_NULL   TB_BLUE
 
+#define MAX_UNDO_DEPTH 1000
+
 typedef struct action {
   size_t off;
   uint8_t old_val;
   uint8_t new_val;
-  struct action *prev;
-  struct action *next;
+  struct action *next; /* single linked-list */
 } __attribute__((packed)) action_t;
+
+typedef struct undo_group {
+  action_t *actions;             /* head of actions in group */
+  action_t *actions_tail;        /* tail of actions for fast append */
+  struct undo_group *parent;
+  struct undo_group *first_child;
+  struct undo_group *next;       /* next sibling (multiple branches) */
+  int seq;                       /* glob sequence number (for persistence/debug) */
+  time_t timestamp;
+} undo_group_t;
 
 struct data_ctx {
   int fd;
@@ -80,7 +92,12 @@ struct editor_view {
 struct editor_ctx {
   struct data_ctx *data;
   struct editor_view *v;
-  action_t *hist; /* head */
+
+  undo_group_t *undo_root;
+  undo_group_t *undo_current;
+  undo_group_t *undo_current_group; /* temp current group */
+  undo_group_t *undo_saved;         /* last saved node */
+  int undo_seq_counter;             /* seq counter */
 };
 
 enum {
@@ -92,18 +109,20 @@ void draw_editor(struct editor_ctx *ctx);
 void handle_input(struct editor_ctx *ctx, struct tb_event *ev);
 void handle_command(struct editor_ctx *ctx);
 
+undo_group_t *undo_group_new(void);
+void undo_init(struct editor_ctx *ctx);
+void undo_free(struct editor_ctx *ctx);
+void undo_group_free(undo_group_t *group);
+void undo_group_free_recurse(undo_group_t *group);
+void undo_add_action(struct editor_ctx *ctx, size_t off, uint8_t old_val, uint8_t new_val);
+void undo_undo(struct editor_ctx *ctx);
+void undo_redo(struct editor_ctx *ctx);
+
 int data_open(struct data_ctx *ctx, const char *path);
 void data_close(struct data_ctx *ctx);
 void data_flush(struct data_ctx *ctx);
 uint8_t data_read(struct data_ctx *ctx, size_t off);
 void data_write(struct data_ctx *ctx, size_t off, uint8_t new);
-
-void hist_init(struct editor_ctx *ctx);
-void hist_free(struct editor_ctx *ctx);
-void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new);
-void hist_add_smart(struct editor_ctx *ctx, size_t off, uint8_t old);
-void hist_undo(struct editor_ctx *ctx);
-void hist_redo(struct editor_ctx *ctx);
 
 int main(int argc, char *argv[])
 {
@@ -122,7 +141,7 @@ int main(int argc, char *argv[])
   ctx.v = &view;
   ctx.data = &data;
 
-  hist_init(&ctx);
+  undo_init(&ctx);
   if (data_open(&data, argv[1]))
     return 1;
 
@@ -145,7 +164,7 @@ int main(int argc, char *argv[])
 
   tb_shutdown();
 
-  hist_free(&ctx);
+  undo_free(&ctx);
   data_close(&data);
 
   return 0;
@@ -269,8 +288,14 @@ void handle_input(struct editor_ctx *ctx, struct tb_event *ev)
   if (v->mode == INSERT) {
     if (ev->key == TB_KEY_ESC) {
       if (v->nibble == 1) {
-        hist_add_smart(ctx, v->cur, v->snap);
+        undo_add_action(ctx, v->cur, v->snap, data_read(ctx->data, v->cur));
         v->nibble = 0;
+      }
+      if (ctx->undo_current_group && ctx->undo_current_group->actions) {
+        ctx->undo_current_group = NULL;
+      } else if (ctx->undo_current_group) {
+        free(ctx->undo_current_group);
+        ctx->undo_current_group = NULL;
       }
       v->mode = NORMAL;
       return;
@@ -279,18 +304,18 @@ void handle_input(struct editor_ctx *ctx, struct tb_event *ev)
     if (isxdigit(ev->ch)) {
       char hex_str[2] = {ev->ch, '\0'};
       uint8_t nib = (uint8_t)strtol(hex_str, NULL, 16);
-      uint8_t cur_byte = data_read(ctx->data, v->cur);
+      uint8_t old_byte = data_read(ctx->data, v->cur);
       uint8_t new_byte;
 
       if (v->nibble == 0) {
-        v->snap = cur_byte;
-        new_byte = (nib << 4) | (cur_byte & 0x0F);
+        v->snap = old_byte;
+        new_byte = (nib << 4) | (old_byte & 0x0F);
         data_write(ctx->data, v->cur, new_byte);
         v->nibble = 1;
       } else {
-        new_byte = nib | (cur_byte & 0xF0);
+        new_byte = nib | (old_byte & 0xF0);
         data_write(ctx->data, v->cur, new_byte);
-        hist_add_smart(ctx, v->cur, v->snap);
+        undo_add_action(ctx, v->cur, v->snap, new_byte);
         v->nibble = 0;
         if (v->cur + 1 < ctx->data->size)
           v->cur++;
@@ -318,20 +343,23 @@ void handle_input(struct editor_ctx *ctx, struct tb_event *ev)
         if (cursor + 1 < ctx->data->size)
           v->cur += 1;
         break;
-      case 'i': /* insert */
-        v->mode = INSERT;
-        v->nibble = 0;
-        break;
       case ':': /* command */
         handle_command(ctx);
         break;
       case 'u': /* undo */
-        hist_undo(ctx);
+        undo_undo(ctx);
+        break;
+      case 'i': /* insert */
+        v->mode = INSERT;
+        v->nibble = 0;
+        ctx->undo_current_group = undo_group_new();
+        ctx->undo_current_group->seq = ++ctx->undo_seq_counter;
+        ctx->undo_current_group->timestamp = time(NULL);
         break;
     }
     switch (ev->key) {
       case TB_KEY_CTRL_R: /* redo */
-        hist_redo(ctx);
+        undo_redo(ctx);
         break;
     }
   }
@@ -393,6 +421,7 @@ void handle_command(struct editor_ctx *ctx)
     v->want_quit = 1;
   } else if (buf[0] == 'w' && buf[1] == '\0') {
     data_flush(ctx->data);
+    ctx->undo_saved = ctx->undo_current;
   } else if (buf[0] == 'w' && buf[1] == 'q' && buf[2] == '\0') {
     data_flush(ctx->data);
     if (!ctx->data->changed)
@@ -445,77 +474,171 @@ void extend_file(struct editor_ctx *ctx, size_t siz)
 }
 */
 
-void hist_init(struct editor_ctx *ctx)
+undo_group_t *undo_group_new(void)
 {
-  ctx->hist = malloc(sizeof(action_t));
-  bzero(ctx->hist, sizeof(action_t));
-  assert(ctx->hist->next == NULL);
-  assert(ctx->hist->prev == NULL);
+  undo_group_t *group = malloc(sizeof(undo_group_t));
+  memset(group, 0, sizeof(undo_group_t));
+  return group;
 }
 
-void hist_free(struct editor_ctx *ctx)
+void undo_init(struct editor_ctx *ctx)
 {
-  action_t *cur = ctx->hist;
-  while (cur->prev) {
-    cur = cur->prev;
-  }
-  while (cur) {
-    action_t *next = cur->next;
-    free(cur);
-    cur = next;
+  ctx->undo_root = malloc(sizeof(undo_group_t));
+  memset(ctx->undo_root, 0, sizeof(undo_group_t));
+  ctx->undo_root->timestamp = time(NULL);
+
+  ctx->undo_saved = ctx->undo_root;
+  ctx->undo_current = ctx->undo_root;
+
+  ctx->undo_current_group = NULL;
+  ctx->undo_seq_counter = 0;
+}
+
+void undo_free(struct editor_ctx *ctx)
+{
+  undo_group_free(ctx->undo_root);
+
+  ctx->undo_root = NULL;
+  ctx->undo_current = NULL;
+  ctx->undo_current_group = NULL;
+}
+
+void undo_group_free(undo_group_t *group)
+{
+  if (!group)
+    return;
+
+  undo_group_t *stack[MAX_UNDO_DEPTH];
+  int top = 0;
+
+  if (top < MAX_UNDO_DEPTH)
+    stack[top++] = group;
+
+  while (top > 0) {
+    undo_group_t *current = stack[--top];
+
+    action_t *act = current->actions;
+    while (act) {
+      action_t *next_act = act->next;
+      free(act);
+      act = next_act;
+    }
+
+    if (current->next) {
+      if (top < MAX_UNDO_DEPTH)
+        stack[top++] = current->next;
+      else
+        undo_group_free_recurse(current->next);
+    }
+
+    if (current->first_child) {
+      if (top < MAX_UNDO_DEPTH)
+        stack[top++] = current->first_child;
+      else
+        undo_group_free_recurse(current->first_child);
+    }
+
+    free(current);
   }
 }
 
-void hist_add(struct editor_ctx *ctx, size_t off, uint8_t old, uint8_t new)
+void undo_group_free_recurse(undo_group_t *group)
 {
-  action_t *cur = ctx->hist->next;
-  while (cur) {
-    action_t *next = cur->next;
-    free(cur);
-    cur = next;
+  if (!group)
+    return;
+
+  action_t *act = group->actions;
+  while (act) {
+    action_t *next = act->next;
+    free(act);
+    act = next;
+  }
+
+  undo_group_t *child = group->first_child;
+  while (child) {
+    undo_group_t *next = child->next;
+    undo_group_free_recurse(child);
+    child = next;
+  }
+
+  free(group);
+}
+
+void undo_add_action(struct editor_ctx *ctx, size_t off, uint8_t old_val, uint8_t new_val)
+{
+  if (new_val == old_val)
+    return;
+
+  if (!ctx->undo_current_group->actions) {
+    undo_group_t *parent = ctx->undo_current;
+    if (parent->first_child == NULL) {
+      parent->first_child = ctx->undo_current_group;
+    } else {
+      undo_group_t *sib = parent->first_child;
+      while (sib->next) sib = sib->next;
+      sib->next = ctx->undo_current_group;
+    }
+    ctx->undo_current_group->parent = parent;
+    ctx->undo_current = ctx->undo_current_group;
   }
 
   action_t *act = malloc(sizeof(action_t));
   act->off = off;
-  act->old_val = old;
-  act->new_val = new;
+  act->old_val = old_val;
+  act->new_val = new_val;
   act->next = NULL;
-  act->prev = ctx->hist;
 
-  ctx->hist->next = act;
-  ctx->hist = act;
+  if (!ctx->undo_current_group->actions) {
+    ctx->undo_current_group->actions = act;
+    ctx->undo_current_group->actions_tail = act;
+  } else {
+    ctx->undo_current_group->actions_tail->next = act;
+    ctx->undo_current_group->actions_tail = act;
+  }
+
+  ctx->data->changed = 1;
 }
 
-void hist_add_smart(struct editor_ctx *ctx, size_t off, uint8_t old)
+void undo_undo(struct editor_ctx *ctx)
 {
-  uint8_t new = data_read(ctx->data, off);
-  if (new != old)
-    hist_add(ctx, off, old, new);
-}
-
-void hist_undo(struct editor_ctx *ctx)
-{
-  if (!ctx->hist->prev)
+  if (!ctx->undo_current->parent)
     return;
 
-  action_t *act = ctx->hist;
+  action_t *act = ctx->undo_current->actions;
+  while (act) {
+    data_write(ctx->data, act->off, act->old_val);
+    act = act->next;
+  }
 
-  data_write(ctx->data, act->off, act->old_val);
-  ctx->hist = act->prev;
+  ctx->undo_current = ctx->undo_current->parent;
 
-  ctx->v->cur = act->off;
+  if (ctx->undo_current->first_child && ctx->undo_current->first_child->actions) {
+    ctx->v->cur = ctx->undo_current->first_child->actions->off;
+  }
+
+  ctx->data->changed = (ctx->undo_current != ctx->undo_saved);
 }
 
-void hist_redo(struct editor_ctx *ctx)
+void undo_redo(struct editor_ctx *ctx)
 {
-  if (!ctx->hist->next)
+  if (!ctx->undo_current->first_child)
     return;
 
-  action_t *act = ctx->hist->next;
-  data_write(ctx->data, act->off, act->new_val);
-  ctx->hist = act;
+  undo_group_t *child = ctx->undo_current->first_child;
+  while (child->next)
+    child = child->next;
 
-  ctx->v->cur = act->off;
+  action_t *act = child->actions;
+  while (act) {
+      data_write(ctx->data, act->off, act->new_val);
+      act = act->next;
+  }
+
+  ctx->undo_current = child;
+
+  ctx->v->cur = child->actions_tail->off;
+
+  ctx->data->changed = (ctx->undo_current != ctx->undo_saved);
 }
 
 #ifdef USE_MMAP
