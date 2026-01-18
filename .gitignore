@@ -1,0 +1,6 @@
+/.cache
+/obj
+
+*.o
+/hxx
+/compile_commands.json
